@@ -9,11 +9,18 @@
 (define-constant ERR-ALREADY-ATTESTED (err u1008))
 (define-constant ERR-ATTESTATION-NOT-FOUND (err u1009))
 (define-constant ERR-INVALID-SCORE (err u1010))
+(define-constant ERR-TIME-LOCK-ACTIVE (err u1011))
+(define-constant ERR-SCHEDULE-NOT-FOUND (err u1012))
+(define-constant ERR-INVALID-TIME (err u1013))
+(define-constant ERR-ALREADY-EXECUTED (err u1014))
+(define-constant ERR-CONDITIONS-NOT-MET (err u1015))
 
 (define-data-var admin principal tx-sender)
 (define-data-var verifier-count uint u0)
 (define-data-var attestation-count uint u0)
 (define-data-var privacy-verification-count uint u0)
+(define-data-var schedule-count uint u0)
+(define-data-var timelock-count uint u0)
 
 (define-map Verifiers 
   principal 
@@ -66,6 +73,44 @@
     verification-time: uint,
     challenge-hash: (buff 32),
     response-hash: (buff 32)
+  }
+)
+
+(define-map ScheduledVerifications
+  {scheduler: principal, schedule-id: uint}
+  {
+    subject: principal,
+    verification-type: (string-ascii 20),
+    target-block: uint,
+    min-age-requirement: uint,
+    conditions: (string-ascii 50),
+    executed: bool,
+    created-at: uint
+  }
+)
+
+(define-map TimeLocks
+  {owner: principal, lock-id: uint}
+  {
+    subject: principal,
+    unlock-block: uint,
+    lock-type: (string-ascii 20),
+    proof-data: (buff 32),
+    conditions-met: bool,
+    created-at: uint
+  }
+)
+
+(define-map ConditionalVerifications
+  {verifier: principal, condition-id: uint}
+  {
+    subject: principal,
+    age-threshold: uint,
+    time-window-start: uint,
+    time-window-end: uint,
+    verification-hash: (buff 32),
+    auto-execute: bool,
+    status: (string-ascii 20)
   }
 )
 
@@ -329,3 +374,241 @@
       (>= (get reputation-score proof) u30)
       (<= (- stacks-block-height (get last-updated proof)) u52560))
     false))
+
+(define-public (schedule-future-verification 
+    (subject principal)
+    (verification-type (string-ascii 20))
+    (target-block uint)
+    (min-age-requirement uint)
+    (conditions (string-ascii 50)))
+  (let (
+    (new-schedule-id (+ (var-get schedule-count) u1)))
+    (begin
+      (asserts! (> target-block stacks-block-height) ERR-INVALID-TIME)
+      (asserts! (> min-age-requirement u0) ERR-INVALID-AGE)
+      (map-set ScheduledVerifications 
+        {scheduler: tx-sender, schedule-id: new-schedule-id}
+        {
+          subject: subject,
+          verification-type: verification-type,
+          target-block: target-block,
+          min-age-requirement: min-age-requirement,
+          conditions: conditions,
+          executed: false,
+          created-at: stacks-block-height
+        })
+      (var-set schedule-count new-schedule-id)
+      (ok new-schedule-id))))
+
+(define-public (create-timelock 
+    (subject principal)
+    (unlock-block uint)
+    (lock-type (string-ascii 20))
+    (proof-data (buff 32)))
+  (let (
+    (new-lock-id (+ (var-get timelock-count) u1))
+    (subject-proof (map-get? AgeProofs subject)))
+    (begin
+      (asserts! (> unlock-block stacks-block-height) ERR-INVALID-TIME)
+      (asserts! (is-some subject-proof) ERR-NOT-REGISTERED)
+      (map-set TimeLocks 
+        {owner: tx-sender, lock-id: new-lock-id}
+        {
+          subject: subject,
+          unlock-block: unlock-block,
+          lock-type: lock-type,
+          proof-data: proof-data,
+          conditions-met: false,
+          created-at: stacks-block-height
+        })
+      (var-set timelock-count new-lock-id)
+      (ok new-lock-id))))
+
+(define-public (unlock-timelock 
+    (lock-id uint)
+    (verification-proof (buff 32)))
+  (let (
+    (timelock (unwrap! (map-get? TimeLocks {owner: tx-sender, lock-id: lock-id}) ERR-SCHEDULE-NOT-FOUND))
+    (subject-proof (unwrap! (map-get? AgeProofs (get subject timelock)) ERR-NOT-REGISTERED))
+    (unlock-block (get unlock-block timelock))
+    (proof-valid (is-eq (get proof-data timelock) verification-proof)))
+    (begin
+      (asserts! (>= stacks-block-height unlock-block) ERR-TIME-LOCK-ACTIVE)
+      (asserts! (not (get conditions-met timelock)) ERR-ALREADY-EXECUTED)
+      (asserts! proof-valid ERR-INVALID-PROOF)
+      (map-set TimeLocks 
+        {owner: tx-sender, lock-id: lock-id}
+        {
+          subject: (get subject timelock),
+          unlock-block: unlock-block,
+          lock-type: (get lock-type timelock),
+          proof-data: (get proof-data timelock),
+          conditions-met: true,
+          created-at: (get created-at timelock)
+        })
+      (ok true))))
+
+(define-public (execute-scheduled-verification 
+    (schedule-id uint))
+  (let (
+    (schedule (unwrap! (map-get? ScheduledVerifications {scheduler: tx-sender, schedule-id: schedule-id}) ERR-SCHEDULE-NOT-FOUND))
+    (subject-proof (unwrap! (map-get? AgeProofs (get subject schedule)) ERR-NOT-REGISTERED))
+    (target-block (get target-block schedule))
+    (min-age (get min-age-requirement schedule))
+    (current-year (/ stacks-block-height u144))
+    (subject-age (- current-year (get birth-year subject-proof))))
+    (begin
+      (asserts! (>= stacks-block-height target-block) ERR-INVALID-TIME)
+      (asserts! (not (get executed schedule)) ERR-ALREADY-EXECUTED)
+      (asserts! (>= subject-age min-age) ERR-CONDITIONS-NOT-MET)
+      (map-set ScheduledVerifications 
+        {scheduler: tx-sender, schedule-id: schedule-id}
+        {
+          subject: (get subject schedule),
+          verification-type: (get verification-type schedule),
+          target-block: target-block,
+          min-age-requirement: min-age,
+          conditions: (get conditions schedule),
+          executed: true,
+          created-at: (get created-at schedule)
+        })
+      (ok true))))
+
+(define-public (setup-conditional-verification 
+    (subject principal)
+    (age-threshold uint)
+    (time-window-start uint)
+    (time-window-end uint)
+    (verification-hash (buff 32))
+    (auto-execute bool))
+  (let (
+    (new-condition-id (+ (var-get schedule-count) u1))
+    (verifier-status (map-get? Verifiers tx-sender)))
+    (begin
+      (asserts! (is-some verifier-status) ERR-UNAUTHORIZED)
+      (asserts! (> time-window-end time-window-start) ERR-INVALID-TIME)
+      (asserts! (> time-window-start stacks-block-height) ERR-INVALID-TIME)
+      (asserts! (> age-threshold u0) ERR-INVALID-AGE)
+      (map-set ConditionalVerifications 
+        {verifier: tx-sender, condition-id: new-condition-id}
+        {
+          subject: subject,
+          age-threshold: age-threshold,
+          time-window-start: time-window-start,
+          time-window-end: time-window-end,
+          verification-hash: verification-hash,
+          auto-execute: auto-execute,
+          status: "PENDING"
+        })
+      (ok new-condition-id))))
+
+(define-public (trigger-conditional-verification 
+    (condition-id uint))
+  (let (
+    (condition (unwrap! (map-get? ConditionalVerifications {verifier: tx-sender, condition-id: condition-id}) ERR-SCHEDULE-NOT-FOUND))
+    (subject-proof (unwrap! (map-get? AgeProofs (get subject condition)) ERR-NOT-REGISTERED))
+    (current-block stacks-block-height)
+    (window-start (get time-window-start condition))
+    (window-end (get time-window-end condition))
+    (age-threshold (get age-threshold condition))
+    (current-year (/ current-block u144))
+    (subject-age (- current-year (get birth-year subject-proof)))
+    (in-time-window (and (>= current-block window-start) (<= current-block window-end)))
+    (age-met (>= subject-age age-threshold)))
+    (begin
+      (asserts! in-time-window ERR-INVALID-TIME)
+      (asserts! age-met ERR-CONDITIONS-NOT-MET)
+      (asserts! (is-eq (get status condition) "PENDING") ERR-ALREADY-EXECUTED)
+      (map-set ConditionalVerifications 
+        {verifier: tx-sender, condition-id: condition-id}
+        {
+          subject: (get subject condition),
+          age-threshold: age-threshold,
+          time-window-start: window-start,
+          time-window-end: window-end,
+          verification-hash: (get verification-hash condition),
+          auto-execute: (get auto-execute condition),
+          status: "EXECUTED"
+        })
+      (ok true))))
+
+(define-public (batch-schedule-verification 
+    (subjects (list 10 principal))
+    (verification-type (string-ascii 20))
+    (target-block uint)
+    (min-age-requirement uint))
+  (let (
+    (base-schedule-id (var-get schedule-count)))
+    (begin
+      (asserts! (> target-block stacks-block-height) ERR-INVALID-TIME)
+      (asserts! (> min-age-requirement u0) ERR-INVALID-AGE)
+      (fold process-batch-schedule subjects base-schedule-id)
+      (ok true))))
+
+(define-private (process-batch-schedule 
+    (subject principal)
+    (current-id uint))
+  (let (
+    (new-id (+ current-id u1)))
+    (begin
+      (map-set ScheduledVerifications 
+        {scheduler: tx-sender, schedule-id: new-id}
+        {
+          subject: subject,
+          verification-type: "BATCH",
+          target-block: (+ stacks-block-height u144),
+          min-age-requirement: u18,
+          conditions: "AUTO-GENERATED",
+          executed: false,
+          created-at: stacks-block-height
+        })
+      (var-set schedule-count new-id)
+      new-id)))
+
+(define-read-only (get-scheduled-verification 
+    (scheduler principal)
+    (schedule-id uint))
+  (map-get? ScheduledVerifications {scheduler: scheduler, schedule-id: schedule-id}))
+
+(define-read-only (get-timelock 
+    (owner principal)
+    (lock-id uint))
+  (map-get? TimeLocks {owner: owner, lock-id: lock-id}))
+
+(define-read-only (get-conditional-verification 
+    (verifier principal)
+    (condition-id uint))
+  (map-get? ConditionalVerifications {verifier: verifier, condition-id: condition-id}))
+
+(define-read-only (check-schedule-eligibility 
+    (schedule-id uint)
+    (scheduler principal))
+  (match (map-get? ScheduledVerifications {scheduler: scheduler, schedule-id: schedule-id})
+    schedule (and 
+      (>= stacks-block-height (get target-block schedule))
+      (not (get executed schedule)))
+    false))
+
+(define-read-only (check-timelock-eligibility 
+    (lock-id uint)
+    (owner principal))
+  (match (map-get? TimeLocks {owner: owner, lock-id: lock-id})
+    timelock (and 
+      (>= stacks-block-height (get unlock-block timelock))
+      (not (get conditions-met timelock)))
+    false))
+
+(define-read-only (get-scheduling-stats)
+  {
+    total-schedules: (var-get schedule-count),
+    total-timelocks: (var-get timelock-count),
+    current-block: stacks-block-height
+  })
+
+(define-read-only (calculate-time-until-unlock 
+    (target-block uint))
+  (if (> target-block stacks-block-height)
+    (- target-block stacks-block-height)
+    u0))
+
+
